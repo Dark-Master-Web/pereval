@@ -4,13 +4,12 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import os
-from dotenv import load_dotenv
+from database import DatabaseManager
 
-load_dotenv()
-
-# Конфигурация
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+# Конфигурация из переменных окружения
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -19,10 +18,28 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 
+# Модели для аутентификации
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class UserRegister(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
 class AuthHandler:
-    def __init__(self):
+    def __init__(self, db_manager: DatabaseManager):
         self.secret_key = SECRET_KEY
         self.algorithm = ALGORITHM
+        self.db_manager = db_manager
 
     def get_password_hash(self, password: str) -> str:
         return pwd_context.hash(password)
@@ -48,8 +65,68 @@ class AuthHandler:
         except JWTError:
             return None
 
+    def register_moderator(self, username: str, email: str, password: str) -> dict:
+        """Регистрация нового модератора"""
+        try:
+            # Проверяем, существует ли уже пользователь с таким username или email
+            with self.db_manager.connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM moderators WHERE username = %s OR email = %s",
+                    (username, email)
+                )
+                existing_user = cursor.fetchone()
 
-auth_handler = AuthHandler()
+                if existing_user:
+                    return {"success": False, "message": "Пользователь с таким именем или email уже существует"}
+
+                # Хэшируем пароль и создаем пользователя
+                hashed_password = self.get_password_hash(password)
+                cursor.execute(
+                    """INSERT INTO moderators (username, email, password_hash) 
+                    VALUES (%s, %s, %s) RETURNING id""",
+                    (username, email, hashed_password)
+                )
+                moderator_id = cursor.fetchone()[0]
+                self.db_manager.connection.commit()
+
+                return {
+                    "success": True,
+                    "message": "Модератор успешно зарегистрирован",
+                    "moderator_id": moderator_id
+                }
+
+        except Exception as e:
+            self.db_manager.connection.rollback()
+            return {"success": False, "message": f"Ошибка при регистрации: {str(e)}"}
+
+    def authenticate_moderator(self, username: str, password: str) -> Optional[dict]:
+        """Аутентификация модератора"""
+        try:
+            with self.db_manager.connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, username, email, password_hash FROM moderators WHERE username = %s",
+                    (username,)
+                )
+                moderator = cursor.fetchone()
+
+                if not moderator:
+                    return None
+
+                moderator_id, db_username, email, hashed_password = moderator
+
+                # Проверяем пароль
+                if not self.verify_password(password, hashed_password):
+                    return None
+
+                return {
+                    "moderator_id": moderator_id,
+                    "username": db_username,
+                    "email": email
+                }
+
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            return None
 
 
 # Зависимость для проверки токена
@@ -59,7 +136,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
+            detail="Неверные учетные данные аутентификации",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return payload
@@ -72,7 +149,7 @@ async def get_current_moderator(credentials: HTTPAuthorizationCredentials = Depe
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
+            detail="Неверные учетные данные аутентификации",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -80,7 +157,17 @@ async def get_current_moderator(credentials: HTTPAuthorizationCredentials = Depe
     if "moderator_id" not in payload:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not enough permissions"
+            detail="Недостаточно прав доступа"
         )
 
     return payload
+
+
+# Глобальный экземпляр auth_handler (будет инициализирован в main.py)
+auth_handler = None
+
+
+def setup_auth_handler(db_manager: DatabaseManager):
+    """Инициализация auth_handler с db_manager"""
+    global auth_handler
+    auth_handler = AuthHandler(db_manager)

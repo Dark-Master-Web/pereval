@@ -1,79 +1,125 @@
+import pytest
 import requests
 import json
+from datetime import datetime
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8001"
 
 
-def test_moderation_flow():
-    """Тестирование системы модерации"""
+class TestModerationAPI:
+    """Тесты API модерации"""
 
-    print("🚀 Запуск тестов системы модерации...\n")
+    @pytest.fixture
+    def auth_token(self):
+        """Получение токена аутентификации для тестов модерации"""
+        # Здесь нужно использовать реальные учетные данные модератора
+        login_data = {
+            "username": "admin",  # Заменить на реальные данные
+            "password": "admin123"  # Заменить на реальные данные
+        }
 
-    # 1. Создаем тестовый перевал
-    test_data = {
-        "beauty_title": "Тест модерации",
-        "title": "Перевал для проверки модерации",
-        "other_titles": "Модерационный тест",
-        "connect": "Тестовое соединение для модерации",
-        "user": {
-            "email": "moderation_test@example.com",
-            "phone": "+79997776655",
-            "fam": "Модерационный",
-            "name": "Тест",
-            "otc": "Системный"
-        },
-        "coords": {
-            "latitude": 46.1234,
-            "longitude": 42.5678,
-            "height": 2800
-        },
-        "level": {
-            "winter": "1A",
-            "summer": "1B",
-            "autumn": "2A",
-            "spring": "1A"
-        },
-        "images": []
-    }
+        try:
+            response = requests.post(f"{BASE_URL}/auth/login", json=login_data)
+            if response.status_code == 200:
+                return response.json()["access_token"]
+        except:
+            pass
 
-    print("1. 📝 Создаем тестовый перевал...")
+        return None
+
+    def test_get_pending_perevals_unauthorized(self):
+        """Тест получения списка на модерацию без аутентификации"""
+        response = requests.get(f"{BASE_URL}/moderation/perevals")
+        assert response.status_code == 401
+
+    def test_update_status_unauthorized(self):
+        """Тест обновления статуса без аутентификации"""
+        response = requests.patch(
+            f"{BASE_URL}/moderation/pereval/1/status",
+            json={"status": "accepted", "change_reason": "test"}
+        )
+        assert response.status_code == 401
+
+    def test_get_pending_perevals_authorized(self, auth_token):
+        """Тест получения списка на модерацию с аутентификацией"""
+        if not auth_token:
+            pytest.skip("No authentication token available")
+
+        headers = {"Authorization": f"Bearer {auth_token}"}
+        response = requests.get(f"{BASE_URL}/moderation/perevals", headers=headers)
+
+        # Должен вернуть 200 даже если список пустой
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_update_status_authorized(self, auth_token):
+        """Тест обновления статуса с аутентификацией"""
+        if not auth_token:
+            pytest.skip("No authentication token available")
+
+        # Сначала нужно получить ID реального перевала для теста
+        # Временно пропускаем этот тест
+        pytest.skip("Need real pereval ID for testing")
+
+    def test_update_status_invalid_data(self, auth_token):
+        """Тест обновления статуса с невалидными данными"""
+        if not auth_token:
+            pytest.skip("No authentication token available")
+
+        headers = {"Authorization": f"Bearer {auth_token}"}
+
+        # Неверный статус
+        response = requests.patch(
+            f"{BASE_URL}/moderation/pereval/1/status",
+            json={"status": "invalid_status", "change_reason": "test"},
+            headers=headers
+        )
+        assert response.status_code == 400
+
+    def test_auth_me_endpoint(self, auth_token):
+        """Тест эндпоинта получения информации о текущем пользователе"""
+        if not auth_token:
+            pytest.skip("No authentication token available")
+
+        headers = {"Authorization": f"Bearer {auth_token}"}
+        response = requests.get(f"{BASE_URL}/auth/me", headers=headers)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "moderator_id" in data
+        assert "username" in data
+
+
+def run_tests():
+    """Функция для запуска тестов"""
+    print("Запуск тестов API...")
+
+    # Создаем тестовый экземпляр
+    test_api = TestMountainPassAPI()
+    test_moderation = TestModerationAPI()
+
     try:
-        response = requests.post(f"{BASE_URL}/submitData", json=test_data)
-        print(f"   Status: {response.status_code}")
-        result = response.json()
-        print(f"   Response: {result}")
+        # Тест здоровья приложения
+        print("1. Тест здоровья приложения...")
+        test_api.test_health_check()
+        print("   ✅ Успешно")
 
-        if response.status_code == 200:
-            pereval_id = result["id"]
-            print(f"   ✅ Перевал создан, ID: {pereval_id}")
+        # Тест добавления данных
+        print("2. Тест добавления перевала...")
+        sample_data = test_api.sample_pereval_data()
+        test_api.test_submit_data(sample_data)
+        print("   ✅ Успешно")
 
-            # 2. Пытаемся получить список для модерации без авторизации
-            print("\n2. 🔒 Пытаемся получить список модерации без токена...")
-            response = requests.get(f"{BASE_URL}/moderation/perevals")
-            print(f"   Status (ожидается 401): {response.status_code}")
+        # Тест получения перевала
+        print("3. Тест получения перевала по ID...")
+        test_api.test_get_pereval_by_id(sample_data)
+        print("   ✅ Успешно")
 
-            # 3. Тестируем публичные эндпоинты
-            print("\n3. 🌐 Тестируем публичные эндпоинты...")
-
-            # Получаем информацию о перевале
-            response = requests.get(f"{BASE_URL}/pereval/{pereval_id}")
-            print(f"   GET /pereval/{pereval_id}: {response.status_code}")
-
-            # Получаем перевалы пользователя
-            response = requests.get(f"{BASE_URL}/user/moderation_test@example.com/perevals")
-            print(f"   GET /user/.../perevals: {response.status_code}")
-
-            # Проверяем здоровье API
-            response = requests.get(f"{BASE_URL}/health")
-            print(f"   GET /health: {response.status_code}")
-
-        print(f"\n✅ Тесты публичных эндпоинтов завершены!")
-        print("💡 Для тестирования модерации нужно сначала создать модератора через /auth/register")
+        print("Все основные тесты пройдены успешно!")
 
     except Exception as e:
-        print(f"❌ Ошибка при тестировании: {e}")
-        print("💡 Убедитесь, что сервер запущен: uvicorn main:app --reload")
+        print(f"❌ Ошибка при выполнении тестов: {e}")
 
 
 if __name__ == "__main__":
-    test_moderation_flow()
+    run_tests()

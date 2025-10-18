@@ -1,55 +1,53 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, status
-from pydantic import BaseModel, EmailStr, validator
-from typing import Optional, List, Dict, Any
-from enum import Enum
-import database
-from auth import auth_handler, get_current_moderator
-from datetime import datetime
-import base64
+from fastapi import FastAPI, HTTPException, Query, Depends
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import os
+from datetime import datetime, timedelta
+from database import DatabaseManager
+from auth import get_current_user, get_current_moderator, setup_auth_handler, auth_handler, UserLogin, UserRegister, \
+    Token
 
 app = FastAPI(
     title="Mountain Pass API",
-    description="API для управления данными о горных перевалах с системой модерации",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    description="API для управления данными о горных перевалах",
+    version="2.0.0"
 )
 
-# Инициализируем менеджер БД
-db = database.DatabaseManager()
+# Конфигурация базы данных из переменных окружения
+db_config = {
+    "host": os.getenv("FSTR_DB_HOST", "localhost"),
+    "port": os.getenv("FSTR_DB_PORT", "5432"),
+    "dbname": os.getenv("FSTR_DB_NAME", "mountain_pass"),
+    "user": os.getenv("FSTR_DB_USER", "postgres"),
+    "password": os.getenv("FSTR_DB_PASSWORD", "password")
+}
+
+db_manager = DatabaseManager(db_config)
 
 
-# --- Модели запросов/ответов ---
-class PerevalStatus(str, Enum):
-    NEW = "new"
-    PENDING = "pending"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
+@app.on_event("startup")
+async def startup_event():
+    """Подключение к базе данных при запуске приложения"""
+    if not db_manager.connect():
+        raise Exception("Failed to connect to database")
+
+    # Инициализация системы аутентификации
+    setup_auth_handler(db_manager)
 
 
-class Coord(BaseModel):
+# Модели Pydantic
+class User(BaseModel):
+    email: str
+    phone: str
+    fam: str
+    name: str
+    otc: str
+
+
+class Coords(BaseModel):
     latitude: float
     longitude: float
     height: int
-
-    @validator('latitude')
-    def validate_latitude(cls, v):
-        if not -90 <= v <= 90:
-            raise ValueError('Latitude must be between -90 and 90')
-        return v
-
-    @validator('longitude')
-    def validate_longitude(cls, v):
-        if not -180 <= v <= 180:
-            raise ValueError('Longitude must be between -180 and 180')
-        return v
-
-    @validator('height')
-    def validate_height(cls, v):
-        if v < 0 or v > 10000:
-            raise ValueError('Height must be between 0 and 10000 meters')
-        return v
 
 
 class Level(BaseModel):
@@ -58,365 +56,199 @@ class Level(BaseModel):
     autumn: Optional[str] = ""
     spring: Optional[str] = ""
 
-    @validator('*')
-    def validate_level(cls, v):
-        if v and v not in ['', '1A', '1B', '2A', '2B', '3A', '3B']:
-            raise ValueError('Invalid difficulty level')
-        return v
 
-
-class User(BaseModel):
-    email: EmailStr
-    phone: str
-    fam: str
-    name: str
-    otc: Optional[str] = ""
-
-    @validator('phone')
-    def validate_phone(cls, v):
-        if not v.strip():
-            raise ValueError('Phone number is required')
-        return v
-
-    @validator('fam', 'name')
-    def validate_name(cls, v):
-        if not v.strip():
-            raise ValueError('Name fields are required')
-        return v
-
-
-class ImageBase64(BaseModel):
-    data: str  # base64 encoded image
+class Image(BaseModel):
+    data: str  # URL или base64 encoded image
     title: str
 
 
-class PerevalRequest(BaseModel):
+class PerevalCreate(BaseModel):
     beauty_title: str
     title: str
-    other_titles: Optional[str] = ""
-    connect: Optional[str] = ""
+    other_titles: str
+    connect: str
     user: User
-    coords: Coord
+    coords: Coords
     level: Level
-    images: List[ImageBase64] = []
-
-    @validator('beauty_title', 'title')
-    def validate_required_fields(cls, v):
-        if not v.strip():
-            raise ValueError('This field is required')
-        return v
+    images: List[Image]
 
 
-class PerevalResponse(BaseModel):
-    id: int
-    beauty_title: str
-    title: str
-    other_titles: Optional[str]
-    connect: Optional[str]
-    status: str
-    add_time: datetime
-    user: Dict[str, Any]
-    coords: Dict[str, Any]
-    level: Dict[str, Any]
-    images: List[Dict[str, Any]]
+class PerevalUpdate(BaseModel):
+    beauty_title: Optional[str] = None
+    title: Optional[str] = None
+    other_titles: Optional[str] = None
+    connect: Optional[str] = None
+    coords: Optional[Coords] = None
+    level: Optional[Level] = None
+    images: Optional[List[Image]] = None
 
 
 class StatusUpdate(BaseModel):
-    status: PerevalStatus
-    reject_reason: Optional[str] = None
-
-
-class ModeratorLogin(BaseModel):
-    email: str
-    password: str
-
-
-class ModeratorCreate(BaseModel):
-    username: str
-    email: EmailStr
-    password: str
-
-    @validator('password')
-    def validate_password(cls, v):
-        if len(v) < 6:
-            raise ValueError('Password must be at least 6 characters long')
-        return v
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class HealthResponse(BaseModel):
     status: str
-    database: str
-    timestamp: datetime
-    version: str
+    change_reason: Optional[str] = ""
 
 
-# --- Эндпоинты аутентификации ---
+# Эндпоинты аутентификации
+
 @app.post("/auth/register", response_model=Dict[str, Any])
-async def register_moderator(moderator: ModeratorCreate):
-    """Регистрация нового модератора."""
-    # Проверяем, не существует ли уже модератор с таким email
-    existing_moderator = db.get_moderator_by_email(moderator.email)
-    if existing_moderator:
+async def register_moderator(user_data: UserRegister):
+    """
+    Регистрация нового модератора
+    """
+    result = auth_handler.register_moderator(
+        username=user_data.username,
+        email=user_data.email,
+        password=user_data.password
+    )
+
+    if result["success"]:
+        return {"status": "success", "message": result["message"], "moderator_id": result["moderator_id"]}
+    else:
+        raise HTTPException(status_code=400, detail=result["message"])
+
+
+@app.post("/auth/login", response_model=Token)
+async def login_moderator(user_data: UserLogin):
+    """
+    Аутентификация модератора и получение JWT токена
+    """
+    moderator = auth_handler.authenticate_moderator(user_data.username, user_data.password)
+    if not moderator:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Moderator with this email already exists"
-        )
-
-    password_hash = auth_handler.get_password_hash(moderator.password)
-    success = db.create_moderator(moderator.username, moderator.email, password_hash)
-
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to create moderator"
-        )
-
-    return {"message": "Moderator successfully registered"}
-
-
-@app.post("/auth/login", response_model=TokenResponse)
-async def login_moderator(login_data: ModeratorLogin):
-    """Аутентификация модератора."""
-    moderator = db.get_moderator_by_email(login_data.email)
-
-    if not moderator or not auth_handler.verify_password(login_data.password, moderator["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
+            status_code=401,
+            detail="Неверное имя пользователя или пароль"
         )
 
     access_token = auth_handler.create_access_token(
-        data={"sub": moderator["email"], "moderator_id": moderator["id"]}
+        data={"moderator_id": moderator["moderator_id"], "username": moderator["username"]}
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-# --- Защищенные эндпоинты (модерация) ---
-@app.get("/moderation/perevals", response_model=Dict[str, Any])
-async def get_perevals_for_moderation(
-        status: Optional[PerevalStatus] = Query(None),
-        skip: int = Query(0, ge=0),
-        limit: int = Query(10, ge=1, le=100),
-        current_user: dict = Depends(get_current_moderator)
-):
-    """Получение списка перевалов для модерации."""
-    result = db.get_perevals_paginated(
-        status=status.value if status else None,
-        skip=skip,
-        limit=limit
-    )
+# Публичные эндпоинты API
+
+@app.post("/submitData")
+async def submit_data(pereval_data: PerevalCreate):
+    """
+    Добавление нового перевала в базу данных
+    """
+    try:
+        result = db_manager.add_pereval(pereval_data.dict())
+        if result["status"] == 200:
+            return {"status": 200, "message": "Отправлено успешно", "id": result["id"]}
+        else:
+            raise HTTPException(status_code=500, detail=result["message"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при добавлении данных: {str(e)}")
+
+
+@app.get("/submitData/{pereval_id}", response_model=Dict[str, Any])
+async def get_pereval(pereval_id: int):
+    """
+    Получить информацию о перевале по ID
+    """
+    pereval_data = db_manager.get_pereval_by_id(pereval_id)
+    if not pereval_data:
+        raise HTTPException(status_code=404, detail="Перевал не найден")
+    return pereval_data
+
+
+@app.patch("/submitData/{pereval_id}")
+async def update_pereval(pereval_id: int, pereval_data: PerevalUpdate):
+    """
+    Обновить существующий перевал
+    Можно редактировать только записи со статусом 'new'
+    Нельзя изменять ФИО, email и телефон пользователя
+    """
+    result = db_manager.update_pereval(pereval_id, pereval_data.dict(exclude_unset=True))
+    if result["state"] == 0:
+        raise HTTPException(status_code=400, detail=result["message"])
     return result
 
 
-@app.patch("/moderation/pereval/{pereval_id}/status")
-async def update_pereval_status_moderation(
-        pereval_id: int,
-        status_update: StatusUpdate,
-        current_user: dict = Depends(get_current_moderator)
-):
-    """Обновление статуса перевала (только для модераторов)."""
-    success = db.update_pereval_status(
-        pereval_id=pereval_id,
-        status=status_update.status.value,
-        moderator_id=current_user.get("moderator_id"),
-        reject_reason=status_update.reject_reason
-    )
-
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pereval not found or update error"
-        )
-
-    return {
-        "status": 200,
-        "message": f"Pereval status updated to '{status_update.status.value}'",
-        "id": pereval_id
-    }
-
-
-@app.get("/moderation/pereval/{pereval_id}/history")
-async def get_pereval_status_history(
-        pereval_id: int,
-        current_user: dict = Depends(get_current_moderator)
-):
-    """Получение истории изменений статуса перевала."""
-    history = db.get_status_history(pereval_id)
-    return {"history": history}
-
-
-# --- Публичные эндпоинты ---
-@app.post("/submitData", response_model=Dict[str, Any])
-async def submit_data(pereval: PerevalRequest):
-    """Основной метод для добавления данных о перевале."""
-    try:
-        print("📥 Получен запрос на добавление перевала...")
-
-        # 1. Добавляем пользователя
-        user_id = db.add_user(
-            email=pereval.user.email,
-            phone=pereval.user.phone,
-            fam=pereval.user.fam,
-            name=pereval.user.name,
-            otc=pereval.user.otc
-        )
-
-        # 2. Добавляем координаты
-        coord_id = db.add_coords(
-            latitude=pereval.coords.latitude,
-            longitude=pereval.coords.longitude,
-            height=pereval.coords.height
-        )
-
-        # 3. Добавляем перевал
-        pereval_id = db.add_pereval(
-            beauty_title=pereval.beauty_title,
-            title=pereval.title,
-            other_titles=pereval.other_titles,
-            connect=pereval.connect,
-            user_id=user_id,
-            coord_id=coord_id
-        )
-
-        # 4. Добавляем уровни сложности
-        db.add_levels(
-            pereval_id=pereval_id,
-            winter=pereval.level.winter,
-            summer=pereval.level.summer,
-            autumn=pereval.level.autumn,
-            spring=pereval.level.spring
-        )
-
-        # 5. Добавляем изображения (base64)
-        image_ids = []
-        for image in pereval.images:
-            try:
-                image_id = db.add_image_base64(image.data, image.title)
-                db.link_image_to_pereval(pereval_id, image_id)
-                image_ids.append(image_id)
-            except Exception as e:
-                print(f"⚠️ Ошибка при добавлении изображения: {e}")
-                # Продолжаем обработку даже если с изображением ошибка
-
-        return {
-            "status": 200,
-            "message": "Data submitted successfully",
-            "id": pereval_id,
-            "images_added": len(image_ids)
-        }
-
-    except Exception as e:
-        print(f"❌ Ошибка при обработке запроса: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}"
-        )
-
-
-@app.get("/pereval/{pereval_id}", response_model=PerevalResponse)
-async def get_pereval(pereval_id: int):
-    """Получение информации о перевале по ID."""
-    pereval_data = db.get_pereval_by_id(pereval_id)
-
-    if not pereval_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pereval not found"
-        )
-
-    # Форматируем ответ
-    response = {
-        "id": pereval_data["id"],
-        "beauty_title": pereval_data["beauty_title"],
-        "title": pereval_data["title"],
-        "other_titles": pereval_data["other_titles"],
-        "connect": pereval_data["connect"],
-        "status": pereval_data["status"],
-        "add_time": pereval_data["add_time"],
-        "user": {
-            "email": pereval_data["email"],
-            "phone": pereval_data["phone"],
-            "fam": pereval_data["fam"],
-            "name": pereval_data["name"],
-            "otc": pereval_data["otc"]
-        },
-        "coords": {
-            "latitude": float(pereval_data["latitude"]),
-            "longitude": float(pereval_data["longitude"]),
-            "height": pereval_data["height"]
-        },
-        "level": {
-            "winter": pereval_data["winter"],
-            "summer": pereval_data["summer"],
-            "autumn": pereval_data["autumn"],
-            "spring": pereval_data["spring"]
-        },
-        "images": pereval_data.get("images", [])
-    }
-
-    return response
-
-
-@app.get("/user/{user_email}/perevals", response_model=List[Dict[str, Any]])
-async def get_user_perevals(user_email: str):
-    """Получение всех перевалов, добавленных пользователем."""
-    perevals = db.get_perevals_by_user(user_email)
+@app.get("/submitData/", response_model=List[Dict[str, Any]])
+async def get_user_perevals(user__email: str = Query(..., alias="user__email")):
+    """
+    Получить все перевалы, отправленные пользователем с указанным email
+    """
+    perevals = db_manager.get_perevals_by_user_email(user__email)
     return perevals
 
 
-@app.get("/", response_model=Dict[str, Any])
-async def root():
-    return {
-        "message": "Mountain Pass API v2.0",
-        "version": "2.0.0",
-        "documentation": "/docs",
-        "health": "/health"
-    }
+@app.get("/pereval/{pereval_id}")
+async def get_pereval_legacy(pereval_id: int):
+    """
+    Легаси эндпоинт для получения перевала по ID
+    """
+    return await get_pereval(pereval_id)
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/user/{email}/perevals")
+async def get_user_perevals_legacy(email: str):
+    """
+    Легаси эндпоинт для получения перевалов пользователя
+    """
+    perevals = db_manager.get_perevals_by_user_email(email)
+    return perevals
+
+
+@app.get("/health")
 async def health_check():
-    """Проверка здоровья API и подключения к БД"""
-    try:
-        with db.conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "timestamp": datetime.now(),
-            "version": "2.0.0"
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e),
-            "timestamp": datetime.now(),
-            "version": "2.0.0"
-        }
+    """
+    Проверка здоровья приложения
+    """
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
-# Обработчики ошибок
-@app.exception_handler(404)
-async def not_found_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "Resource not found"}
+# Эндпоинты модерации (требуют аутентификации)
+
+@app.get("/moderation/perevals")
+async def get_pending_perevals(current_moderator: dict = Depends(get_current_moderator)):
+    """
+    Получить список перевалов для модерации
+    Требует аутентификации модератора
+    """
+    perevals = db_manager.get_pending_perevals()
+    return perevals
+
+
+@app.patch("/moderation/pereval/{pereval_id}/status")
+async def update_pereval_status(
+        pereval_id: int,
+        status_update: StatusUpdate,
+        current_moderator: dict = Depends(get_current_moderator)
+):
+    """
+    Обновить статус перевала (accepted/rejected)
+    Требует аутентификации модератора
+    """
+    new_status = status_update.status
+    change_reason = status_update.change_reason
+
+    if new_status not in ["accepted", "rejected"]:
+        raise HTTPException(status_code=400, detail="Статус должен быть 'accepted' или 'rejected'")
+
+    result = db_manager.update_pereval_status(
+        pereval_id,
+        new_status,
+        current_moderator["moderator_id"],
+        change_reason
     )
 
+    if result["success"]:
+        return {"status": "success", "message": f"Статус обновлен на {new_status}"}
+    else:
+        raise HTTPException(status_code=400, detail=result["message"])
 
-@app.exception_handler(500)
-async def internal_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
+
+# Эндпоинт для проверки аутентификации
+@app.get("/auth/me")
+async def get_current_user_info(current_moderator: dict = Depends(get_current_moderator)):
+    """
+    Получить информацию о текущем аутентифицированном модераторе
+    """
+    return current_moderator
 
 
 if __name__ == "__main__":
